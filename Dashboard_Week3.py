@@ -1190,8 +1190,8 @@ def interactive_market_clearing_section():
                 st.session_state.supply_offers, [], single_demand_mode=True, total_demand=total_demand
             )
         
-        # Create visualization
-        fig = create_market_clearing_plot(
+        # Create visualization with welfare analysis
+        fig, consumer_surplus, producer_surplus, total_cost = create_market_clearing_plot(
             st.session_state.supply_offers, 
             st.session_state.demand_bids if market_mode == "Multi-tier Bidding" else [],
             dispatched_offers, satisfied_demands, clearing_price, equilibrium_qty,
@@ -1219,29 +1219,54 @@ def interactive_market_clearing_section():
     with col2:
         st.subheader("Market Results")
         
-        # Display equilibrium metrics - keep as requested
+        # Display equilibrium metrics
         if clearing_price > 0:
             st.metric("Clearing Price", f"${clearing_price:.1f}/MWh")
             st.metric("Cleared Quantity", f"{equilibrium_qty:.0f} MW")
-            
-            # Calculate total welfare
-            total_gen_surplus = sum(
-                (clearing_price - offer['price']) * offer['dispatched'] 
-                for offer in dispatched_offers
+        
+        # Economic Welfare Analysis Section
+        st.subheader("💰 Economic Welfare Analysis")
+        
+        if market_mode == "Multi-tier Bidding":
+            # Consumer Surplus
+            st.metric(
+                "Consumer Surplus", 
+                f"${consumer_surplus:,.0f}",
+                help="Net benefit to consumers (willingness to pay minus actual payment)"
+            )
+        
+        # Producer Surplus (Scarcity Rent)
+        st.metric(
+            "Producer Surplus (Scarcity Rent)", 
+            f"${producer_surplus:,.0f}",
+            help="Generator profit above marginal cost"
+        )
+        
+        # Total Generation Cost
+        st.metric(
+            "Total Generation Cost", 
+            f"${total_cost:,.0f}",
+            help="Total variable cost of electricity production"
+        )
+        
+        if market_mode == "Multi-tier Bidding":
+            # Total Welfare
+            total_welfare = consumer_surplus + producer_surplus
+            st.metric(
+                "Total Economic Welfare", 
+                f"${total_welfare:,.0f}",
+                help="Sum of consumer and producer surplus"
             )
             
-            if market_mode == "Multi-tier Bidding":
-                total_consumer_surplus = sum(
-                    (demand['price'] - clearing_price) * demand['satisfied']
-                    for demand in satisfied_demands
+            # Market Efficiency Indicator
+            total_payment = clearing_price * equilibrium_qty
+            if total_payment > 0:
+                efficiency_ratio = total_welfare / total_payment
+                st.metric(
+                    "Market Efficiency Ratio",
+                    f"{efficiency_ratio:.2f}",
+                    help="Total welfare relative to total payments"
                 )
-                st.metric("Consumer Surplus", f"${total_consumer_surplus:.0f}")
-            
-            st.metric("Producer Surplus", f"${total_gen_surplus:.0f}")
-            
-            if market_mode == "Multi-tier Bidding":
-                total_welfare = total_consumer_surplus + total_gen_surplus
-                st.metric("Total Welfare", f"${total_welfare:.0f}")
         
         # Market insights
         st.subheader("💡 Market Insights")
@@ -1260,14 +1285,23 @@ def interactive_market_clearing_section():
             # Technology mix analysis
             tech_dispatch = {}
             for offer in dispatched_offers:
-                tech_type = next(gen['type'] for gen in COURSE_GENERATORS.values() 
-                               if gen == COURSE_GENERATORS[offer['generator']])
-                tech_dispatch[tech_type] = tech_dispatch.get(tech_type, 0) + offer['dispatched']
+                if offer['dispatched'] > 0:
+                    tech_type = offer['type']
+                    tech_dispatch[tech_type] = tech_dispatch.get(tech_type, 0) + offer['dispatched']
             
             st.markdown("**Technology Mix**")
             for tech, dispatch in tech_dispatch.items():
                 pct = (dispatch / equilibrium_qty * 100) if equilibrium_qty > 0 else 0
                 st.markdown(f"• **{tech}**: {dispatch:.0f} MW ({pct:.1f}%)")
+            
+            # Welfare insights
+            if market_mode == "Multi-tier Bidding":
+                if consumer_surplus > producer_surplus:
+                    st.success("🛡️ Consumer-favorable market conditions")
+                elif producer_surplus > consumer_surplus * 2:
+                    st.warning("⚡ High scarcity rents - tight supply conditions")
+                else:
+                    st.info("⚖️ Balanced welfare distribution")
             
             # Price insights
             if clearing_price == 0:
@@ -1276,13 +1310,6 @@ def interactive_market_clearing_section():
                 st.info("💚 Low-cost generation dominating market")
             elif clearing_price > 100:
                 st.warning("⚡ High prices indicate scarcity or peaking generation")
-            
-            # Efficiency insights
-            if market_mode == "Multi-tier Bidding":
-                if len(dispatched_offers) < len(st.session_state.supply_offers) // 2:
-                    st.info("🔧 Market operating efficiently - only low-cost generation needed")
-                else:
-                    st.warning("⚠️ High demand requiring expensive generation")
         
         # Control buttons
         st.subheader("🔄 Market Controls")
@@ -1307,6 +1334,7 @@ def interactive_market_clearing_section():
             if market_mode == "Multi-tier Bidding" and 'demand_bids' in st.session_state:
                 total_demand_bids = sum(bid['demand'] for bid in st.session_state.demand_bids)
                 st.metric("Total Demand Bids", f"{total_demand_bids:.0f} MW")
+
 
 def generate_multi_tier_offers():
     """Generate 3-tier supply offers for each generator"""
@@ -1466,6 +1494,263 @@ def find_market_equilibrium_multi_tier(supply_offers, demand_bids, single_demand
         return dispatched_offers, satisfied_demands, clearing_price, equilibrium_qty
 
 def create_market_clearing_plot(supply_offers, demand_bids, dispatched_offers, satisfied_demands, clearing_price, equilibrium_qty, single_demand_mode=False):
+    """Create market clearing visualization with supply and demand curves and welfare areas"""
+    fig = go.Figure()
+    
+    # Calculate welfare areas for display
+    consumer_surplus = 0
+    producer_surplus = 0
+    total_cost = 0
+    
+    if not single_demand_mode and demand_bids:
+        # Build demand curve points for proper shading
+        demand_curve_x = [0]
+        demand_curve_y = [float('inf')]  # Start very high
+        cumulative_demand = 0
+        
+        sorted_demands = sorted(demand_bids, key=lambda x: x['price'], reverse=True)
+        
+        for demand in sorted_demands:
+            demand_curve_x.extend([cumulative_demand, cumulative_demand + demand['demand']])
+            demand_curve_y.extend([demand['price'], demand['price']])
+            cumulative_demand += demand['demand']
+        
+        # Close the demand curve
+        demand_curve_x.append(cumulative_demand)
+        demand_curve_y.append(0)
+        
+        # Add demand curve as a line
+        fig.add_trace(go.Scatter(
+            x=demand_curve_x[1:-1],  # Remove the infinite start and zero end
+            y=demand_curve_y[1:-1],
+            mode='lines',
+            name='Demand Curve',
+            line=dict(color='red', width=3),
+            showlegend=True
+        ))
+        
+        # Add individual demand blocks with satisfaction status
+        cumulative_demand = 0
+        for demand in sorted_demands:
+            is_satisfied = demand.get('satisfied', 0) > 0
+            opacity = 1.0 if is_satisfied else 0.3
+            
+            fig.add_trace(go.Scatter(
+                x=[cumulative_demand, cumulative_demand + demand['demand']],
+                y=[demand['price'], demand['price']],
+                name=f"{demand['retailer']} (Tier {demand['tier']})",
+                line=dict(color='red', width=4),
+                opacity=opacity,
+                showlegend=True,
+                hovertemplate=(
+                    f"<b>{demand['retailer']}</b><br>" +
+                    f"Tier: {demand['tier']}<br>" +
+                    f"Price: ${demand['price']:.2f}/MWh<br>" +
+                    f"Demand: {demand['demand']:.1f} MW<br>" +
+                    f"Satisfied: {demand.get('satisfied', 0):.1f} MW<extra></extra>"
+                )
+            ))
+            
+            # Calculate consumer surplus for satisfied demand
+            if is_satisfied:
+                satisfied_qty = demand.get('satisfied', 0)
+                consumer_surplus += (demand['price'] - clearing_price) * satisfied_qty
+            
+            cumulative_demand += demand['demand']
+    
+    # Build supply curve points for proper shading
+    supply_curve_x = [0]
+    supply_curve_y = [0]
+    cumulative_supply = 0
+    
+    sorted_offers = sorted(dispatched_offers, key=lambda x: x['price'])
+    
+    for offer in sorted_offers:
+        supply_curve_x.extend([cumulative_supply, cumulative_supply + offer['capacity']])
+        supply_curve_y.extend([offer['price'], offer['price']])
+        cumulative_supply += offer['capacity']
+    
+    # Add supply curve as a line
+    fig.add_trace(go.Scatter(
+        x=supply_curve_x,
+        y=supply_curve_y,
+        mode='lines',
+        name='Supply Curve',
+        line=dict(color='blue', width=3),
+        showlegend=True
+    ))
+    
+    # Add individual generator blocks with dispatch status
+    cumulative_supply = 0
+    for offer in sorted_offers:
+        is_dispatched = offer['dispatched'] > 0
+        opacity = 1.0 if is_dispatched else 0.3
+        
+        fig.add_trace(go.Scatter(
+            x=[cumulative_supply, cumulative_supply + offer['capacity']],
+            y=[offer['price'], offer['price']],
+            name=f"{offer['generator']} (Tier {offer['tier']})",
+            line=dict(color=offer['color'], width=6),
+            opacity=opacity,
+            showlegend=True,
+            hovertemplate=(
+                f"<b>{offer['generator']}</b><br>" +
+                f"Tier: {offer['tier']}<br>" +
+                f"Price: ${offer['price']:.2f}/MWh<br>" +
+                f"Capacity: {offer['capacity']:.1f} MW<br>" +
+                f"Dispatched: {offer['dispatched']:.1f} MW<extra></extra>"
+            )
+        ))
+        
+        # Calculate costs and producer surplus for dispatched offers
+        if is_dispatched:
+            dispatched_qty = offer['dispatched']
+            total_cost += offer['price'] * dispatched_qty
+            producer_surplus += (clearing_price - offer['price']) * dispatched_qty
+        
+        cumulative_supply += offer['capacity']
+    
+    # Add welfare area shadings
+    if equilibrium_qty > 0:
+        # 1. Consumer Surplus (area above clearing price, below demand curve)
+        if not single_demand_mode and demand_bids:
+            # Create consumer surplus shading
+            cs_x = [0]
+            cs_y = [clearing_price]
+            cumulative_demand = 0
+            
+            for demand in sorted_demands:
+                if demand.get('satisfied', 0) > 0:
+                    satisfied_qty = demand.get('satisfied', 0)
+                    cs_x.extend([cumulative_demand, cumulative_demand + satisfied_qty])
+                    cs_y.extend([demand['price'], demand['price']])
+                    cumulative_demand += satisfied_qty
+                    if cumulative_demand >= equilibrium_qty:
+                        break
+            
+            # Close the area
+            cs_x.append(equilibrium_qty)
+            cs_y.append(clearing_price)
+            
+            fig.add_trace(go.Scatter(
+                x=cs_x,
+                y=cs_y,
+                fill='toself',
+                fillcolor='rgba(144,238,144,0.4)',  # Light green
+                line=dict(width=0),
+                name='Consumer Surplus',
+                showlegend=True,
+                hovertemplate=f'Consumer Surplus: ${consumer_surplus:,.0f}<extra></extra>'
+            ))
+        
+        # 2. Producer Surplus/Scarcity Rent (area above supply curve, below clearing price)
+        ps_x = [0]
+        ps_y = [clearing_price]
+        cumulative_supply = 0
+        
+        for offer in sorted_offers:
+            if offer['dispatched'] > 0:
+                dispatched_qty = offer['dispatched']
+                ps_x.extend([cumulative_supply, cumulative_supply + dispatched_qty])
+                ps_y.extend([offer['price'], offer['price']])
+                cumulative_supply += dispatched_qty
+                if cumulative_supply >= equilibrium_qty:
+                    break
+        
+        # Close the area
+        ps_x.append(equilibrium_qty)
+        ps_y.append(clearing_price)
+        
+        fig.add_trace(go.Scatter(
+            x=ps_x,
+            y=ps_y,
+            fill='toself',
+            fillcolor='rgba(173,216,230,0.4)',  # Light blue
+            line=dict(width=0),
+            name='Producer Surplus (Scarcity Rent)',
+            showlegend=True,
+            hovertemplate=f'Producer Surplus: ${producer_surplus:,.0f}<extra></extra>'
+        ))
+        
+        # 3. Total Cost (area below supply curve)
+        cost_x = [0, 0]
+        cost_y = [0, 0]
+        cumulative_supply = 0
+        
+        for offer in sorted_offers:
+            if offer['dispatched'] > 0:
+                dispatched_qty = offer['dispatched']
+                cost_x.extend([cumulative_supply, cumulative_supply + dispatched_qty])
+                cost_y.extend([offer['price'], offer['price']])
+                cumulative_supply += dispatched_qty
+                if cumulative_supply >= equilibrium_qty:
+                    break
+        
+        # Close the area to x-axis
+        cost_x.extend([equilibrium_qty, 0])
+        cost_y.extend([0, 0])
+        
+        fig.add_trace(go.Scatter(
+            x=cost_x,
+            y=cost_y,
+            fill='toself',
+            fillcolor='rgba(255,182,193,0.4)',  # Light pink
+            line=dict(width=0),
+            name='Total Generation Cost',
+            showlegend=True,
+            hovertemplate=f'Total Cost: ${total_cost:,.0f}<extra></extra>'
+        ))
+    
+    # Add clearing price line and vertical line at equilibrium
+    fig.add_hline(
+        y=clearing_price,
+        line_color="green",
+        line_width=3,
+        line_dash="dash",
+        annotation_text=f"Clearing Price: ${clearing_price:.2f}/MWh"
+    )
+    
+    fig.add_vline(
+        x=equilibrium_qty,
+        line_color="green",
+        line_width=3,
+        line_dash="dash",
+        annotation_text=f"Cleared Quantity: {equilibrium_qty:.0f} MW"
+    )
+    
+    # Add equilibrium point
+    fig.add_trace(go.Scatter(
+        x=[equilibrium_qty],
+        y=[clearing_price],
+        mode='markers',
+        name='Market Clearing Point',
+        marker=dict(color='green', size=15, symbol='star'),
+        hovertemplate=(
+            f"<b>Market Clearing Point</b><br>" +
+            f"Price: ${clearing_price:.2f}/MWh<br>" +
+            f"Quantity: {equilibrium_qty:.1f} MW<extra></extra>"
+        )
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title="Market Clearing Analysis with Economic Welfare",
+        xaxis_title="Cumulative Quantity (MW)",
+        yaxis_title="Price ($/MWh)",
+        height=700,
+        showlegend=True,
+        hovermode='closest',
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.02
+        )
+    )
+    
+    return fig, consumer_surplus, producer_surplus, total_cost
+
     """Create market clearing visualization with supply and demand curves"""
     fig = go.Figure()
     
